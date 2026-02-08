@@ -42,6 +42,7 @@ class MusicSynthesizer:
             '2️⃣ Two Fingers': 'D',
             '3️⃣ Three Fingers': 'E',
             '4️⃣ Four Fingers': 'F',
+            '🤘 Rock Sign': 'G',
             '✋ Open Palm': 'A',
             '👍 Thumbs Up': 'B',
             '✊ Closed Fist': 'SILENCE'
@@ -190,6 +191,10 @@ class HandGestureDetector:
             if thumb_wrist_dist > 0.2:
                 return "👍 Thumbs Up", 0.9
         
+        # Rock Sign (G) - index and pinky extended, middle and ring closed
+        if index_extended and pinky_extended and not middle_extended and not ring_extended:
+            return "🤘 Rock Sign", 0.9
+        
         # Counting gestures (C, D, E, F)
         if fingers_up_count == 1 and not thumb_extended:
             return "1️⃣ One Finger", 0.85
@@ -332,6 +337,7 @@ def main():
     print("  2️⃣  Two Fingers  → D (293.66 Hz)")
     print("  3️⃣  Three Fingers → E (329.63 Hz)")
     print("  4️⃣  Four Fingers → F (349.23 Hz)")
+    print("  🤘 Rock Sign    → G (392.00 Hz)")
     print("  ✋ Open Palm    → A (440.00 Hz)")
     print("  👍 Thumbs Up    → B (493.88 Hz)")
     print("  ✊ Closed Fist  → Silence")
