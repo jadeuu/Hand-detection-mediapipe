@@ -2,8 +2,13 @@ import cv2
 import numpy as np
 import math
 import os
+import time
 import sounddevice as sd
+import threading
+import queue
 from collections import deque
+from datetime import datetime
+import subprocess
 
 try:
     from mediapipe import Image, ImageFormat
@@ -105,6 +110,252 @@ class MusicSynthesizer:
                 self.stream.close()
         except Exception as e:
             print(f"Cleanup error: {e}")
+
+
+class AudioRecorder:
+    """Records audio from microphone and saves video with audio"""
+    
+    def __init__(self, sample_rate=44100):
+        self.sample_rate = sample_rate
+        self.audio_frames = []
+        self.desktop_audio_frames = []
+        self.is_recording = False
+        self.audio_queue = queue.Queue()
+        self.desktop_queue = queue.Queue()
+        self.stream = None
+        self.desktop_stream = None
+        
+    def audio_callback(self, indata, frames, time_info, status):
+        """Callback for audio input"""
+        if status:
+            print(f"Microphone status: {status}")
+        # Collect frames while recording
+        if self.is_recording:
+            self.audio_frames.append(indata.copy())
+        self.audio_queue.put(indata.copy())
+    
+    def desktop_callback(self, indata, frames, time_info, status):
+        """Callback for desktop audio input"""
+        if status:
+            print(f"Desktop audio status: {status}")
+        # Collect desktop audio frames while recording
+        if self.is_recording:
+            self.desktop_audio_frames.append(indata.copy())
+        self.desktop_queue.put(indata.copy())
+    
+    def start_recording(self):
+        """Start recording audio from microphone and desktop"""
+        self.is_recording = True
+        self.audio_frames = []
+        self.desktop_audio_frames = []
+        
+        try:
+            self.stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                callback=self.audio_callback,
+                blocksize=2048
+            )
+            self.stream.start()
+            print("Microphone recording started...")
+            
+            # Try to record desktop audio (stereo mix / loopback device)
+            try:
+                # Get list of available devices
+                devices = sd.query_devices()
+                stereo_mix_device = None
+                
+                # Look for stereo mix or loopback device
+                for i, device in enumerate(devices):
+                    if device['max_input_channels'] > 0:
+                        if 'stereo mix' in device['name'].lower() or 'loopback' in device['name'].lower():
+                            stereo_mix_device = i
+                            break
+                
+                if stereo_mix_device is not None:
+                    self.desktop_stream = sd.InputStream(
+                        device=stereo_mix_device,
+                        samplerate=self.sample_rate,
+                        channels=1,
+                        callback=self.desktop_callback,
+                        blocksize=2048
+                    )
+                    self.desktop_stream.start()
+                    print(f"Desktop audio recording started from device: {stereo_mix_device}")
+                else:
+                    print("Stereo mix/loopback device not found. Desktop audio won't be recorded.")
+                    print("To enable: Settings → Sound → Volume mix options → Turn on stereo mix")
+            except Exception as e:
+                print(f"Desktop audio recording skipped: {e}")
+                
+        except Exception as e:
+            print(f"Error starting recording: {e}")
+            self.is_recording = False
+    
+    def stop_recording(self):
+        """Stop recording audio"""
+        self.is_recording = False
+        
+        if self.stream:
+            self.stream.stop()
+            time.sleep(0.1)
+            self.stream.close()
+        
+        if self.desktop_stream:
+            self.desktop_stream.stop()
+            time.sleep(0.1)
+            self.desktop_stream.close()
+        
+        # Collect microphone audio
+        while not self.audio_queue.empty():
+            try:
+                frame = self.audio_queue.get_nowait()
+                self.audio_frames.append(frame)
+            except queue.Empty:
+                break
+        
+        # Collect desktop audio
+        while not self.desktop_queue.empty():
+            try:
+                frame = self.desktop_queue.get_nowait()
+                self.desktop_audio_frames.append(frame)
+            except queue.Empty:
+                break
+        
+        print(f"Recording stopped. Microphone frames: {len(self.audio_frames)}, Desktop frames: {len(self.desktop_audio_frames)}")
+        return self.get_audio_data()
+    
+    def get_audio_data(self):
+        """Get recorded audio as numpy array"""
+        if not self.audio_frames:
+            return None
+        return np.concatenate(self.audio_frames, axis=0)
+    
+    def get_desktop_audio_data(self):
+        """Get recorded desktop audio as numpy array"""
+        if not self.desktop_audio_frames:
+            return None
+        return np.concatenate(self.desktop_audio_frames, axis=0)
+    
+
+    
+    def save_video_with_audio(self, video_frames, fps, output_filename=None):
+        """Save video with recorded audio to desktop"""
+        if not output_filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_filename = f"hand_gesture_recording_{timestamp}.mp4"
+        
+        # Get desktop path
+        desktop_path = os.path.expanduser("~/Desktop")
+        output_path = os.path.join(desktop_path, output_filename)
+        
+        if not video_frames:
+            print("No video frames to save")
+            return None
+        
+        # Get video properties
+        frame = video_frames[0]
+        h, w, c = frame.shape
+        
+        # Create temporary video file without audio
+        temp_video_path = os.path.join(desktop_path, f"temp_{output_filename}")
+        
+        # Write video
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(temp_video_path, fourcc, fps, (w, h))
+        
+        for frame in video_frames:
+            out.write(frame)
+        out.release()
+        print(f"Video written: {len(video_frames)} frames at {fps} fps")
+        
+        # If we have audio, combine video and audio using ffmpeg
+        audio_data = self.get_audio_data()
+        desktop_audio_data = self.get_desktop_audio_data()
+        
+        print(f"Microphone audio shape: {audio_data.shape if audio_data is not None else 'None'}")
+        print(f"Desktop audio shape: {desktop_audio_data.shape if desktop_audio_data is not None else 'None'}")
+        
+        # Mix microphone and desktop audio if both exist
+        if desktop_audio_data is not None and len(desktop_audio_data) > 0:
+            print("Mixing microphone and desktop audio...")
+            # Make sure both are same length
+            min_len = min(len(audio_data), len(desktop_audio_data))
+            audio_data = audio_data[:min_len]
+            desktop_audio_data = desktop_audio_data[:min_len]
+            
+            # Mix with equal volume
+            audio_data = (audio_data + desktop_audio_data) / 2
+        
+        if audio_data is not None and len(audio_data) > 0:
+            # Save audio temporarily
+            temp_audio_path = os.path.join(desktop_path, f"temp_audio_{output_filename}.wav")
+            
+            try:
+                import scipy.io.wavfile as wavfile
+                
+                # Normalize audio
+                max_val = np.max(np.abs(audio_data))
+                if max_val > 0:
+                    audio_normalized = audio_data / max_val
+                else:
+                    audio_normalized = audio_data
+                
+                # Convert to int16
+                audio_int16 = np.int16(audio_normalized * 32767)
+                wavfile.write(temp_audio_path, self.sample_rate, audio_int16)
+                print(f"Audio file saved: {temp_audio_path} ({len(audio_int16)} samples)")
+                
+                # Combine video and audio using ffmpeg
+                try:
+                    ffmpeg_path = r'c:\Users\janel\Documents\vscode\Hand-detection-mediapipe\ffmpeg-8.0.1\ffmpeg-2026-02-09-git-9bfa1635ae-full_build\ffmpeg-2026-02-09-git-9bfa1635ae-full_build\bin\ffmpeg.exe'
+                    
+                    print("Running FFmpeg to combine video and audio...")
+                    result = subprocess.run([
+                        ffmpeg_path, '-i', temp_video_path, '-i', temp_audio_path,
+                        '-c:v', 'copy', '-c:a', 'aac', '-shortest', '-y',
+                        output_path
+                    ], capture_output=True, text=True, timeout=60)
+                    
+                    if result.returncode != 0:
+                        print(f"FFmpeg error: {result.stderr}")
+                        print("Saving video without audio instead...")
+                        # If FFmpeg fails, just return the video without audio
+                        print(f"Video saved to: {temp_video_path}")
+                        return temp_video_path
+                    
+                    # Clean up temporary files
+                    if os.path.exists(temp_video_path):
+                        os.remove(temp_video_path)
+                    if os.path.exists(temp_audio_path):
+                        os.remove(temp_audio_path)
+                    
+                    print(f"\n✓ Video with audio saved to: {output_path}")
+                    return output_path
+                    
+                except FileNotFoundError as e:
+                    print(f"FFmpeg not found: {e}")
+                    print("Saving video without audio.")
+                    print(f"Video saved to: {temp_video_path}")
+                    return temp_video_path
+                except Exception as e:
+                    print(f"FFmpeg error: {e}")
+                    print("Saving video without audio.")
+                    return temp_video_path
+                    
+            except ImportError:
+                print("scipy not installed. Saving video without audio.")
+                print(f"Video saved to: {temp_video_path}")
+                return temp_video_path
+            except Exception as e:
+                print(f"Audio save error: {e}")
+                print(f"Video saved to: {temp_video_path}")
+                return temp_video_path
+        else:
+            print("No audio data recorded.")
+            print(f"Video saved to: {temp_video_path}")
+            return temp_video_path
+            return temp_video_path
 
 
 class HandGestureDetector:
@@ -262,56 +513,24 @@ class HandGestureDetector:
             (5, 9), (9, 13), (13, 17)
         ]
         
+        # Draw hand connections in blue with thin lines
         for start_idx, end_idx in connections:
             if start_idx < len(landmarks) and end_idx < len(landmarks):
                 start = landmarks[start_idx]
                 end = landmarks[end_idx]
                 start_pos = (int(start.x * w), int(start.y * h))
                 end_pos = (int(end.x * w), int(end.y * h))
-                cv2.line(frame, start_pos, end_pos, (0, 255, 0), 2)
+                cv2.line(frame, start_pos, end_pos, (255, 0, 0), 1)  # Blue color, thin line
         
+        # Draw hand landmarks as small blue circles
         for landmark in landmarks:
             x, y = int(landmark.x * w), int(landmark.y * h)
-            cv2.circle(frame, (x, y), 4, (255, 0, 0), -1)
+            cv2.circle(frame, (x, y), 2, (255, 0, 0), -1)  # Blue circles, smaller
     
     def draw_gestures(self, frame, gestures, current_note):
         """Draw detected gestures and current note on frame"""
-        h, w, c = frame.shape
-        
-        for i, (gesture_name, confidence, landmarks, hand_label) in enumerate(gestures):
-            if not landmarks or len(landmarks) != 21:
-                continue
-                
-            x_coords = [pt.x for pt in landmarks]
-            y_coords = [pt.y for pt in landmarks]
-            
-            x_min, x_max = int(min(x_coords) * w), int(max(x_coords) * w)
-            y_min, y_max = int(min(y_coords) * h), int(max(y_coords) * h)
-            
-            x_min, x_max = max(0, x_min - 20), min(w, x_max + 20)
-            y_min, y_max = max(0, y_min - 20), min(h, y_max + 20)
-            
-            # Draw bounding box
-            cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 3)
-            
-            # Draw gesture label
-            label = f"{hand_label}: {gesture_name}"
-            if current_note and current_note != 'SILENCE':
-                label += f" → {current_note}"
-            
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.8
-            thickness = 2
-            text_size = cv2.getTextSize(label, font, font_scale, thickness)[0]
-            
-            label_y = max(30, y_min - 10)
-            cv2.rectangle(frame, 
-                         (x_min, label_y - text_size[1] - 5),
-                         (x_min + text_size[0] + 5, label_y + 5),
-                         (0, 255, 0), -1)
-            cv2.putText(frame, label, (x_min + 2, label_y - 2),
-                       font, font_scale, (0, 0, 0), thickness)
-        
+        # Just return frame without drawing text or boxes
+        # Hand landmarks are already drawn in process_frame
         return frame
 
 
@@ -319,6 +538,7 @@ def main():
     """Main function to run gesture-controlled music"""
     detector = HandGestureDetector()
     synthesizer = MusicSynthesizer()
+    recorder = AudioRecorder()
     
     cap = cv2.VideoCapture(0)
     
@@ -326,11 +546,15 @@ def main():
         print("Error: Could not open camera")
         return
     
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30  # Default FPS
+    
     cv2.namedWindow('Gesture-Controlled Music', cv2.WINDOW_NORMAL)
     cv2.resizeWindow('Gesture-Controlled Music', 1200, 800)
     
     print("\n" + "=" * 70)
-    print(" Gesture-Controlled Musical Instrument")
+    print(" Gesture-Controlled Musical Instrument with Voice Recording")
     print("=" * 70)
     print("\nGesture → Note Mapping:")
     print("  1️⃣  One Finger   → C (261.63 Hz)")
@@ -343,92 +567,98 @@ def main():
     print("  ✊ Closed Fist  → Silence")
     print("\n" + "=" * 70)
     print("Instructions:")
-    print("  • Show gestures to play musical notes")
-    print("  • Notes play continuously until gesture changes")
-    print("  • Make a fist to stop sound")
-    print("\nPress ESC to exit")
+    print("  • Show gestures to control hand tracking")
+    print("  • SPACE: Start/Stop microphone recording")
+    print("  • 'R': Save recording to Desktop (microphone + desktop audio mixed)")
+    print("  • ESC: Exit application")
+    print("=" * 70)
+    print("Recording Features:")
+    print("  🎤 Microphone audio recording")
+    print("  🎵 Desktop audio capture (if stereo mix enabled)")
     print("=" * 70 + "\n")
     
     frame_count = 0
     last_gesture = None
+    video_frames = []
+    is_recording = False
     
     try:
         while True:
-            try:
-                success, frame = cap.read()
+            success, frame = cap.read()
+            
+            if not success:
+                print("Error: Failed to capture frame")
+                break
+            
+            frame_count += 1
+            
+            # Process frame for gestures
+            frame, gestures = detector.process_frame(frame)
+            
+            # Store frame if recording
+            if is_recording:
+                video_frames.append(frame.copy())
+            
+            # Update music based on gesture
+            current_gesture = None
+            current_note = synthesizer.current_note
+            
+            if gestures:
+                gesture_name = gestures[0][0]
+                current_gesture = gesture_name
                 
-                if not success:
-                    print("Error: Failed to capture frame")
-                    break
-                
-                frame_count += 1
-                
-                # Process frame for gestures
-                frame, gestures = detector.process_frame(frame)
-                
-                # Update music based on gesture
-                current_gesture = None
-                current_note = synthesizer.current_note
-                
-                if gestures:
-                    gesture_name = gestures[0][0]
-                    current_gesture = gesture_name
-                    
-                    # Check if gesture changed
-                    if gesture_name != last_gesture:
-                        note = synthesizer.get_note_for_gesture(gesture_name)
-                        if note:
-                            print(f"Gesture: {gesture_name} → Note: {note}")
-                            synthesizer.play_note(note)
-                            last_gesture = gesture_name
+                # Check if gesture changed
+                if gesture_name != last_gesture:
+                    note = synthesizer.get_note_for_gesture(gesture_name)
+                    if note:
+                        last_gesture = gesture_name
+            else:
+                # No gesture detected - stop sound
+                if last_gesture is not None:
+                    last_gesture = None
+            
+            # Draw gestures with current note
+            frame = detector.draw_gestures(frame, gestures, current_note)
+            
+            # Add recording status indicator
+            status_text = "Recording" if is_recording else "Ready"
+            status_color = (0, 255, 0) if is_recording else (0, 0, 255)
+            cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+            
+            # Display the frame
+            cv2.imshow('Gesture-Controlled Music', frame)
+            
+            # Handle key presses
+            key = cv2.waitKey(1) & 0xFF
+            
+            if key == 27:  # ESC
+                break
+            elif key == ord(' '):  # SPACE - Start/Stop recording
+                if not is_recording:
+                    recorder.start_recording()
+                    video_frames = []
+                    is_recording = True
                 else:
-                    # No gesture detected - stop sound
-                    if last_gesture is not None:
-                        print("No gesture detected → Silence")
-                        synthesizer.play_note('SILENCE')
-                        last_gesture = None
-                
-                # Draw gestures with current note
-                frame = detector.draw_gestures(frame, gestures, current_note)
-                
-                # Display info
-                h, w, c = frame.shape
-                cv2.putText(frame, f'Frame: {frame_count}', (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-                cv2.putText(frame, 'Press ESC to quit', (10, 70),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-                
-                if detector.hand_detector_ready:
-                    status_text = "✓ Music Mode Active"
-                    color = (0, 255, 0)
+                    recorder.stop_recording()
+                    is_recording = False
+                    print(f"Recorded {len(video_frames)} frames")
+            elif key == ord('r') or key == ord('R'):  # R - Save recording
+                if video_frames:
+                    print("Saving recording...")
+                    output_path = recorder.save_video_with_audio(video_frames, fps)
+                    if output_path:
+                        print(f"Successfully saved to: {output_path}")
+                    video_frames = []
                 else:
-                    status_text = "✗ Model Not Ready"
-                    color = (0, 0, 255)
-                cv2.putText(frame, status_text, (10, 110),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-                
-                # Show current note
-                if current_note and current_note != 'SILENCE':
-                    note_text = f"Playing: {current_note}"
-                    cv2.putText(frame, note_text, (10, h - 20),
-                               cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
-                
-                cv2.imshow('Gesture-Controlled Music', frame)
-                
-                key = cv2.waitKey(1) & 0xFF
-                if key == 27:
-                    print("\nExiting...")
-                    break
-                    
-            except Exception as e:
-                print(f"Frame processing error: {e}")
-                continue
+                    print("No frames to save. Start recording first (SPACE).")
     
     except KeyboardInterrupt:
         print("\nInterrupted by user")
     except Exception as e:
         print(f"Application error: {e}")
     finally:
+        if is_recording:
+            recorder.stop_recording()
         print("Cleaning up...")
         synthesizer.cleanup()
         cap.release()
